@@ -1,0 +1,19 @@
+{
+    "roles": [
+        {
+            "current": "Owner",
+            "accept": [],
+            "reject": ["*"]
+        },
+        {
+            "current": "User Access Administrator",
+            "accept": ["*"],
+            "reject": ["Role Based Access Control Administrator"]
+        },
+        {
+            "current": "Contributor",
+            "accept": ["Owner", "User Access Administrator", "Role Based Access Control Administrator"],
+            "reject": ["*"]
+        }
+    ]
+}

@@ -1,0 +1,175 @@
+parameters:
+
+- name: RITMnumber
+  displayName: RITM Number
+  type: string
+  default: None
+
+- name: SubscriptionID 
+  displayName: SubscriptionID 
+  type: string
+
+- name: UsersPermissionList
+  displayName: User and Permission List in JSON format
+  type: string
+  default: "{'data':[{'user':'firstname.lastname@wolterskluwer.com','role':['PermissionName1','PermissionName2']}]}"
+
+resources:
+  repositories:
+  - repository: devops
+    type: git
+    name: WKServices/WK Services - DevOps Scripts
+
+trigger: none
+
+variables:
+
+- name: TaggingStandardVersion
+  value: 4
+
+- name: catalogItem
+  value: Cloud Infrastructure & Entitlement Management
+
+- ${{ if eq(variables['Build.SourceBranchName'], 'master') }}:
+  - group: WK-Services-ADO-ServiceNow-Integration-Prod
+- ${{ if ne(variables['Build.SourceBranchName'], 'master') }}:
+  - group: WK-Services-ADO-ServiceNow-Integration-Stage
+
+- name: URL
+  ${{ if eq(variables['Build.SourceBranchName'], 'master') }}:
+    value: https://service-management.wolterskluwer.com/api/wkus/adotesting2021
+  ${{ if eq(variables['Build.SourceBranchName'], 'QA-Branch') }}:
+    value: https://qawolterskluwer.service-now.com/api/wkus/adotesting2021    
+  ${{ if eq(variables['Build.SourceBranchName'], 'stage') }}:
+    value: https://stgwolterskluwer.service-now.com/api/wkus/adotesting2021
+  ${{ if and(ne(variables['Build.SourceBranchName'], 'master'), ne(variables['Build.SourceBranchName'], 'QA-Branch'), ne(variables['Build.SourceBranchName'], 'stage'))}}:
+    value: https://devwolterskluwer.service-now.com/api/wkus/adotesting2021  
+
+
+stages:
+    ### PRE-VALIDATION STAGE ###
+  - stage: Validation_stage
+    displayName: Pre-validation Stage
+    pool:
+      vmImage: "ubuntu-22.04"
+    jobs:
+      ### Ticket and branch validation step
+      - job: TicketAndBranch_validation
+        displayName: Ticket and branch validation step
+        steps:
+          - checkout: devops
+          - task: PowerShell@2
+            enabled: true
+            displayName: Check ticket ID and branch
+            inputs:
+              targetType: filePath
+              filePath: "$(System.DefaultWorkingDirectory)/pipelines/pipeline_validation/check_ticket_branch.ps1"
+              arguments: '-RITMnumber "${{parameters.RITMnumber}}" -URL "$(URL)" -rainierUserId "$(WK-Services-ADO-ServiceNow-Integration-UserName)" -rainierPassword "$(WK-Services-ADO-ServiceNow-Integration-Password)"'
+              errorActionPreference: "stop"
+              failOnStderr: true
+              pwsh: true
+      ### Git permissions validation step
+      - job: Git_validation
+        displayName: Git permissions validation step
+        dependsOn: TicketAndBranch_validation
+        condition: succeeded()
+        steps:
+          - checkout: devops
+          - task: PowerShell@2
+            enabled: true
+            displayName: Verify Git and Branch Permissions
+            env:
+              ACCESS_TOKEN: $(system.accesstoken)
+            inputs:
+              targetType: filePath
+              filePath: "$(System.DefaultWorkingDirectory)/pipelines/pipeline_validation/Verify-GitBranchPermissions.ps1"
+              arguments: '-configpath "$(System.DefaultWorkingDirectory)/pipelines/pipeline_validation/config.json"'
+              errorActionPreference: "stop"
+              failOnStderr: true
+              pwsh: true
+      ### RITM ID validation step
+      - job: RITM_validation
+        displayName: RITM ID validation step
+        dependsOn: Git_validation
+        condition: and(succeeded(), ne('${{ parameters.RITMnumber }}', 'None'))
+        steps:
+          - checkout: devops
+          - task: UsePythonVersion@0
+            displayName: "Use Python 3.7"
+            inputs:
+              versionSpec: 3.7
+          - script: |
+              pip3 install boto3
+              pip3 install requests
+            displayName: "Installing AWS SDK for Python"
+          - task: PythonScript@0
+            displayName: "RITM Validation"
+            inputs:
+              scriptPath: "$(System.DefaultWorkingDirectory)/pipelines/pipeline_validation/ritm_validation.py"
+              arguments: '-rainierUserId "$(WK-Services-ADO-ServiceNow-Integration-UserName)" -rainierPassword "$(WK-Services-ADO-ServiceNow-Integration-Password)" -RITMnumber "${{parameters.RITMnumber}}" -URL "$(URL)" -catalogItem "$(catalogItem)"'
+              workingDirectory: "$(System.DefaultWorkingDirectory)/pipelines/pipeline_validation/"
+      ### Tags validation step
+      - job: Tags_validation
+        displayName: Tags validation step
+        dependsOn: [Git_validation,RITM_validation]
+        condition: or(succeeded(), eq('${{ parameters.RITMnumber }}', 'None'))
+        steps:
+          - checkout: devops
+          - task: Bash@3
+            name: Tags_validation_Status
+            inputs: 
+              targetType: inline
+              script: echo "##vso[task.setvariable variable=IS_TAGS_VALIDATION_START;isOutput=true]True"
+          - task: PowerShell@2
+            enabled: true
+            displayName: Validate Tags
+            inputs:
+              targetType: filePath
+              filePath: "$(System.DefaultWorkingDirectory)/pipelines/tags_validation/TagsValidation.ps1"
+              errorActionPreference: continue
+              failOnStderr: true
+              pwsh: true
+            env:
+              ${{ each parameter in parameters }}:
+                ${{ parameter.Key }}: ${{ parameter.Value }}
+              ${{ each variable in variables }}:
+                ${{ variable.Key }}: ${{ variable.Value }}
+
+    ### EXECUTION STAGE ###
+  - stage: Execution_stage
+    displayName: Create Role Assignment
+    condition: succeeded()
+    jobs:
+    - job: CreateRoleAssignment
+      pool:
+        vmImage: windows-2019
+      steps:
+      - task: AzurePowerShell@4
+        displayName: 'Azure PowerShell Agent Global Values'
+        name: PowershellInputValues
+        inputs:
+          azureSubscription: 'wk-service-subscription'
+          ScriptType: 'InlineScript'
+          Inline: |
+            Write-Host "##vso[task.setvariable variable=URL]$(URL)"
+            Write-Host "##vso[task.setvariable variable=rainierusername]$(WK-Services-ADO-ServiceNow-Integration-UserName)"
+            Write-Host "##vso[task.setvariable variable=rainierpasswords]$(WK-Services-ADO-ServiceNow-Integration-Password)"
+          preferredAzurePowerShellVersion: '11.0.0'
+          azurePowerShellVersion: OtherVersion
+          pwsh: true
+
+      - task: AzurePowerShell@5
+        displayName: 'Execute CreateRoleAssignment script'
+        inputs:
+          azureSubscription: 'wk-service-subscription'
+          ScriptType: FilePath
+          failOnStderr: true
+          ScriptPath: '$(System.DefaultWorkingDirectory)/Azure/CreateRoleAssignment/NewRoleAssignment.ps1'
+          preferredAzurePowerShellVersion: '11.0.0'
+          azurePowerShellVersion: OtherVersion
+          pwsh: true
+        env:
+          ${{ each parameter in parameters }}:
+            ${{ parameter.Key }}: ${{ parameter.Value }}
+          ${{ each variable in variables }}:
+            ${{ variable.Key }}: ${{ variable.Value }}  
